@@ -1,6 +1,6 @@
 """
 app.py — Whale Parser
-Alchemy Webhook → скоринг → Telegram алерт → збереження в БД
+Alchemy Webhook → глибокий аналіз (Etherscan) → скор → Telegram алерт → БД
 """
 import os
 import asyncio
@@ -12,17 +12,16 @@ from web3 import Web3
 
 from database import (
     init_db, upsert_wallet, save_trade,
-    is_cache_fresh, get_cached_profile,
-    get_copytrade_candidates, get_stats,
-    COPYTRADE_MIN_SCORE,
+    is_cache_fresh, needs_deep_analysis, get_cached_profile,
+    get_copytrade_candidates, get_stats, COPYTRADE_MIN_SCORE,
 )
+from etherscan import deep_analyze
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Конфіг ──────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 MIN_ETH     = float(os.getenv("MIN_ETH_THRESHOLD", "10"))
@@ -34,15 +33,14 @@ w3  = Web3(Web3.HTTPProvider(ALCHEMY_RPC)) if ALCHEMY_RPC else None
 
 init_db()
 
-# ── Відомі лейбли (lowercase) ────────────────────────────────────────────────
-WHALE_LABELS: dict[str, str] = {
+WHALE_LABELS = {
     "0xd8da6bf26964af9d7eed9e03e53415d37aa96045": "Vitalik Buterin",
     "0x47ac0fb4f2d84898e4d9e7b4dab3c24507a6d503": "Binance Hot Wallet",
     "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8": "Binance Cold",
     "0x28c6c06298d514db089934071355e5743bf21d60": "Binance 14",
 }
 
-def load_wallets(path: str = "wallets.txt") -> set[str]:
+def load_wallets(path="wallets.txt"):
     if not os.path.exists(path):
         return set()
     with open(path) as f:
@@ -52,34 +50,36 @@ WATCHED_WALLETS = load_wallets()
 log.info(f"Watching {len(WATCHED_WALLETS)} wallets")
 
 
-# ── Скоринг гаманця ──────────────────────────────────────────────────────────
+def get_label(address):
+    return WHALE_LABELS.get(address.lower(), f"{address[:6]}...{address[-4:]}")
+
 
 def fetch_and_score(address: str, label: str = ""):
     """
-    Свіжий кеш (< 1 год) → з БД.
-    Інакше → запит до ноди → зберегти в БД.
+    1. Якщо є свіжий кеш — повертає з БД
+    2. Якщо перший раз бачимо — робить глибокий аналіз через Etherscan
+    3. Інакше — простий скор через RPC
     """
     if is_cache_fresh(address):
         return get_cached_profile(address)
 
-    if not w3:
-        log.warning("No ALCHEMY_RPC_URL — skipping on-chain scoring")
-        return None
+    # Отримуємо баланс і tx_count через RPC
+    balance_eth = 0.0
+    tx_count    = 0
+    if w3:
+        try:
+            checksum    = w3.to_checksum_address(address)
+            balance_eth = float(w3.from_wei(w3.eth.get_balance(checksum), "ether"))
+            tx_count    = w3.eth.get_transaction_count(checksum)
+        except Exception as e:
+            log.error(f"RPC error for {address}: {e}")
 
-    try:
-        checksum = w3.to_checksum_address(address)
-        balance  = float(w3.from_wei(w3.eth.get_balance(checksum), "ether"))
-        tx_count = w3.eth.get_transaction_count(checksum)
-        return upsert_wallet(address, balance, tx_count, label)
-    except Exception as e:
-        log.error(f"Error fetching wallet {address}: {e}")
-        return None
+    # Глибокий аналіз через Etherscan (тільки якщо ще не робили)
+    deep_metrics = None
+    if needs_deep_analysis(address):
+        deep_metrics = deep_analyze(address, balance_eth)
 
-
-# ── Форматування алерту ──────────────────────────────────────────────────────
-
-def get_label(address: str) -> str:
-    return WHALE_LABELS.get(address.lower(), f"{address[:6]}...{address[-4:]}")
+    return upsert_wallet(address, balance_eth, tx_count, label, deep_metrics)
 
 
 def build_alert(activity: dict, profile):
@@ -98,10 +98,24 @@ def build_alert(activity: dict, profile):
 
         direction = "📤 SEND" if frm.lower() in WATCHED_WALLETS else "📥 RECEIVE"
 
+        # Базовий рядок скору
         score_line = ""
+        pnl_line   = ""
         candidate_line = ""
+
         if profile:
             score_line = f"*Score:* `{profile.score}/100` {profile.tier}\n"
+
+            if profile.deep_analyzed:
+                dep_sign = "+" if profile.deposit_change_pct >= 0 else ""
+                pnl_sign = "+" if profile.trading_pnl_pct >= 0 else ""
+                pnl_line = (
+                    f"*Депозит 90д:* `{dep_sign}{profile.deposit_change_pct:.1f}%` | "
+                    f"*P&L угод:* `{pnl_sign}{profile.trading_pnl_pct:.1f}%`\n"
+                    f"*Обсяг 90д:* `{profile.eth_volume_90d:,.0f} ETH` | "
+                    f"*Txs 90д:* `{profile.tx_count_90d}`\n"
+                )
+
             if profile.is_copytrade_candidate:
                 candidate_line = "⭐ *Кандидат для копітрейдингу*\n"
 
@@ -111,6 +125,7 @@ def build_alert(activity: dict, profile):
             f"*To:* `{get_label(to)}`\n"
             f"*Amount:* `{value_eth:,.4f} {asset}`\n"
             f"{score_line}"
+            f"{pnl_line}"
             f"*Block:* `{block}`\n"
             f"{candidate_line}\n"
             f"[🔍 Etherscan](https://etherscan.io/tx/{tx})"
@@ -124,16 +139,12 @@ def build_alert(activity: dict, profile):
 async def send_telegram(msg: str):
     try:
         await bot.send_message(
-            chat_id=CHAT_ID,
-            text=msg,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
+            chat_id=CHAT_ID, text=msg,
+            parse_mode="Markdown", disable_web_page_preview=True,
         )
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-
-# ── Роути ────────────────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -150,11 +161,9 @@ def webhook():
         if not frm:
             continue
 
-        # 1. Скоринг (з кешем)
         label   = WHALE_LABELS.get(frm.lower(), "")
         profile = fetch_and_score(frm, label)
 
-        # 2. Будуємо і надсилаємо алерт
         result = build_alert(activity, profile)
         if not result:
             continue
@@ -163,7 +172,6 @@ def webhook():
         asyncio.run(send_telegram(msg))
         alerts_sent += 1
 
-        # 3. Зберігаємо угоду в history
         save_trade(
             tx_hash       = activity.get("hash", ""),
             from_addr     = frm,
@@ -184,14 +192,9 @@ def health():
 
 @app.route("/candidates", methods=["GET"])
 def candidates():
-    """Топ гаманці для копітрейдингу."""
     limit = int(request.args.get("limit", 50))
     data  = get_copytrade_candidates(limit)
-    return jsonify({
-        "min_score":  COPYTRADE_MIN_SCORE,
-        "count":      len(data),
-        "candidates": data,
-    })
+    return jsonify({"min_score": COPYTRADE_MIN_SCORE, "count": len(data), "candidates": data})
 
 
 @app.route("/", methods=["GET"])
