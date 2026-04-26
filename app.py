@@ -113,7 +113,7 @@ def build_alert(activity: dict, profile):
                     f"*P&L угод:* `{pnl_sign}{profile.trading_pnl_pct:.1f}%`\n"
                     f"*Обсяг 90д:* `{profile.eth_volume_90d:,.0f} ETH` | "
                     f"*Txs 90д:* `{profile.tx_count_90d}`\n"
-        
+                )
 
             if profile.is_copytrade_candidate:
                 candidate_line = "⭐ *Кандидат для копітрейдингу*\n"
@@ -128,6 +128,7 @@ def build_alert(activity: dict, profile):
             f"*Block:* `{block}`\n"
             f"{candidate_line}\n"
             f"[🔍 Etherscan](https://etherscan.io/tx/{tx})"
+        )
 
         return msg, value_eth
     except Exception as e:
@@ -182,7 +183,7 @@ def webhook():
             asset         = activity.get("asset", "ETH"),
             block_num     = activity.get("blockNum", ""),
             score_at_time = profile.score if profile else 0,
-
+        )
 
     return jsonify({"ok": True, "alerts_sent": alerts_sent}), 200
 
