@@ -3,10 +3,9 @@ app.py — Whale Parser
 Alchemy Webhook → глибокий аналіз (Etherscan) → скор → Telegram алерт → БД
 """
 import os
-import asyncio
 import logging
+import requests
 from flask import Flask, request, jsonify
-from telegram import Bot
 from dotenv import load_dotenv
 from web3 import Web3
 
@@ -28,7 +27,7 @@ MIN_ETH     = float(os.getenv("MIN_ETH_THRESHOLD", "10"))
 ALCHEMY_RPC = os.getenv("ALCHEMY_RPC_URL", "")
 
 app = Flask(__name__)
-bot = Bot(token=BOT_TOKEN)
+
 w3  = Web3(Web3.HTTPProvider(ALCHEMY_RPC)) if ALCHEMY_RPC else None
 
 init_db()
@@ -114,7 +113,7 @@ def build_alert(activity: dict, profile):
                     f"*P&L угод:* `{pnl_sign}{profile.trading_pnl_pct:.1f}%`\n"
                     f"*Обсяг 90д:* `{profile.eth_volume_90d:,.0f} ETH` | "
                     f"*Txs 90д:* `{profile.tx_count_90d}`\n"
-                )
+        
 
             if profile.is_copytrade_candidate:
                 candidate_line = "⭐ *Кандидат для копітрейдингу*\n"
@@ -129,19 +128,22 @@ def build_alert(activity: dict, profile):
             f"*Block:* `{block}`\n"
             f"{candidate_line}\n"
             f"[🔍 Etherscan](https://etherscan.io/tx/{tx})"
-        )
+
         return msg, value_eth
     except Exception as e:
         log.error(f"build_alert error: {e}")
         return None
 
 
-async def send_telegram(msg: str):
+def send_telegram(msg: str):
     try:
-        await bot.send_message(
-            chat_id=CHAT_ID, text=msg,
-            parse_mode="Markdown", disable_web_page_preview=True,
-        )
+        
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": CHAT_ID, "text": msg,
+            "parse_mode": "Markdown", "disable_web_page_preview": True,
+        }, timeout=10)
+
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -169,7 +171,7 @@ def webhook():
             continue
 
         msg, value_eth = result
-        asyncio.run(send_telegram(msg))
+        send_telegram(msg)
         alerts_sent += 1
 
         save_trade(
@@ -180,7 +182,7 @@ def webhook():
             asset         = activity.get("asset", "ETH"),
             block_num     = activity.get("blockNum", ""),
             score_at_time = profile.score if profile else 0,
-        )
+
 
     return jsonify({"ok": True, "alerts_sent": alerts_sent}), 200
 
