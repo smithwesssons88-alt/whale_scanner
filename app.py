@@ -23,13 +23,11 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
-MIN_ETH     = float(os.getenv("MIN_ETH_THRESHOLD", "10"))
+MIN_ETH     = float(os.getenv("MIN_ETH_THRESHOLD", "5"))
 ALCHEMY_RPC = os.getenv("ALCHEMY_RPC_URL", "")
 
 app = Flask(__name__)
-
 w3  = Web3(Web3.HTTPProvider(ALCHEMY_RPC)) if ALCHEMY_RPC else None
-
 init_db()
 
 WHALE_LABELS = {
@@ -54,15 +52,9 @@ def get_label(address):
 
 
 def fetch_and_score(address: str, label: str = ""):
-    """
-    1. Якщо є свіжий кеш — повертає з БД
-    2. Якщо перший раз бачимо — робить глибокий аналіз через Etherscan
-    3. Інакше — простий скор через RPC
-    """
     if is_cache_fresh(address):
         return get_cached_profile(address)
 
-    # Отримуємо баланс і tx_count через RPC
     balance_eth = 0.0
     tx_count    = 0
     if w3:
@@ -73,7 +65,6 @@ def fetch_and_score(address: str, label: str = ""):
         except Exception as e:
             log.error(f"RPC error for {address}: {e}")
 
-    # Глибокий аналіз через Etherscan (тільки якщо ще не робили)
     deep_metrics = None
     if needs_deep_analysis(address):
         deep_metrics = deep_analyze(address, balance_eth)
@@ -81,25 +72,48 @@ def fetch_and_score(address: str, label: str = ""):
     return upsert_wallet(address, balance_eth, tx_count, label, deep_metrics)
 
 
+def parse_value(activity: dict) -> tuple[float, str]:
+    """Парсить суму і актив з активності Alchemy."""
+    asset = activity.get("asset", "ETH")
+    raw   = activity.get("value", "0x0")
+
+    # ETH — hex рядок
+    if isinstance(raw, str) and raw.startswith("0x"):
+        value = int(raw, 16) / 1e18
+        return value, asset
+
+    # Token transfers — value може бути числом або рядком
+    try:
+        value = float(raw or 0)
+    except:
+        value = 0.0
+
+    return value, asset
+
+
 def build_alert(activity: dict, profile):
     try:
-        raw = activity.get("value", "0x0")
-        value_eth = int(raw, 16) / 1e18 if isinstance(raw, str) and raw.startswith("0x") else float(raw or 0)
-
-        if value_eth < MIN_ETH:
-            return None
-
         frm   = activity.get("fromAddress", "")
         to    = activity.get("toAddress", "")
-        asset = activity.get("asset", "ETH")
         tx    = activity.get("hash", "")
         block = activity.get("blockNum", "")
 
+        value_eth, asset = parse_value(activity)
+
+        # Для ETH перевіряємо мінімальний поріг
+        # Для токенів (USDT, USDC тощо) пропускаємо якщо немає ETH еквіваленту
+        if asset == "ETH" and value_eth < MIN_ETH:
+            log.info(f"Skip: {value_eth:.4f} ETH < {MIN_ETH} ETH threshold")
+            return None
+
+        # Пропускаємо нульові token transfers
+        if asset != "ETH" and value_eth == 0:
+            return None
+
         direction = "📤 SEND" if frm.lower() in WATCHED_WALLETS else "📥 RECEIVE"
 
-        # Базовий рядок скору
-        score_line = ""
-        pnl_line   = ""
+        score_line     = ""
+        pnl_line       = ""
         candidate_line = ""
 
         if profile:
@@ -118,11 +132,17 @@ def build_alert(activity: dict, profile):
             if profile.is_copytrade_candidate:
                 candidate_line = "⭐ *Кандидат для копітрейдингу*\n"
 
+        # Форматування суми
+        if asset == "ETH":
+            amount_str = f"{value_eth:,.4f} ETH"
+        else:
+            amount_str = f"{value_eth:,.2f} {asset}"
+
         msg = (
             f"🐋 *Whale Alert* {direction}\n\n"
             f"*From:* `{get_label(frm)}`\n"
             f"*To:* `{get_label(to)}`\n"
-            f"*Amount:* `{value_eth:,.4f} {asset}`\n"
+            f"*Amount:* `{amount_str}`\n"
             f"{score_line}"
             f"{pnl_line}"
             f"*Block:* `{block}`\n"
@@ -138,13 +158,17 @@ def build_alert(activity: dict, profile):
 
 def send_telegram(msg: str):
     try:
-        
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": CHAT_ID, "text": msg,
-            "parse_mode": "Markdown", "disable_web_page_preview": True,
+        resp = requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
         }, timeout=10)
-
+        if not resp.ok:
+            log.error(f"Telegram error: {resp.status_code} {resp.text}")
+        else:
+            log.info("Telegram alert sent OK")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -163,6 +187,8 @@ def webhook():
         frm = activity.get("fromAddress", "")
         if not frm:
             continue
+
+        log.info(f"Activity: from={frm[:10]}... asset={activity.get('asset')} value={activity.get('value')}")
 
         label   = WHALE_LABELS.get(frm.lower(), "")
         profile = fetch_and_score(frm, label)
