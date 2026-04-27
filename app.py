@@ -57,50 +57,75 @@ def get_eth_balance(address):
         return 0.0
 
 def get_etherscan_history(address):
-    """Get last 90 days tx stats from Etherscan"""
-    try:
-        # Normal transactions
-        url = "https://api.etherscan.io/api"
-        cutoff = int(time.time()) - 90 * 86400
+    """Get last 90 days tx stats from Etherscan with retry"""
+    url = "https://api.etherscan.io/api"
+    cutoff = int(time.time()) - 90 * 86400
+    empty = {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
 
-        params = {
-            "module": "account",
-            "action": "txlist",
-            "address": address,
-            "startblock": 0,
-            "endblock": 99999999,
-            "sort": "desc",
-            "apikey": ETHERSCAN_API_KEY
-        }
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
+    if not ETHERSCAN_API_KEY:
+        logger.error("ETHERSCAN_API_KEY not set!")
+        return empty
 
-        if data.get("status") != "1":
-            return {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
+    params = {
+        "module": "account",
+        "action": "txlist",
+        "address": address,
+        "startblock": 0,
+        "endblock": 99999999,
+        "sort": "desc",
+        "apikey": ETHERSCAN_API_KEY
+    }
 
-        txs = data.get("result", [])
-        recent = [tx for tx in txs if int(tx.get("timeStamp", 0)) >= cutoff]
+    for attempt in range(3):
+        try:
+            logger.info(f"Etherscan request for {address[:10]}... (attempt {attempt+1})")
+            r = requests.get(url, params=params, timeout=20)
+            data = r.json()
+            status = data.get("status")
+            message = data.get("message", "")
+            logger.info(f"Etherscan response: status={status} message={message}")
 
-        tx_count = len(recent)
-        total_in = sum(int(tx["value"]) for tx in recent if tx.get("to", "").lower() == address.lower() and tx.get("isError") == "0")
-        total_out = sum(int(tx["value"]) for tx in recent if tx.get("from", "").lower() == address.lower() and tx.get("isError") == "0")
+            if status == "1":
+                txs = data.get("result", [])
+                recent = [tx for tx in txs if int(tx.get("timeStamp", 0)) >= cutoff]
+                tx_count = len(recent)
 
-        total_in_eth = total_in / 1e18
-        total_out_eth = total_out / 1e18
-        volume = total_in_eth + total_out_eth
+                total_in = sum(
+                    int(tx["value"]) for tx in recent
+                    if tx.get("to", "").lower() == address.lower() and tx.get("isError") == "0"
+                )
+                total_out = sum(
+                    int(tx["value"]) for tx in recent
+                    if tx.get("from", "").lower() == address.lower() and tx.get("isError") == "0"
+                )
 
-        pnl_pct = ((total_in_eth - total_out_eth) / total_out_eth * 100) if total_out_eth > 0 else 0
-        deposit_change_pct = ((total_in_eth - total_out_eth) / max(total_out_eth, 1) * 100)
+                total_in_eth = total_in / 1e18
+                total_out_eth = total_out / 1e18
+                volume = total_in_eth + total_out_eth
+                pnl_pct = ((total_in_eth - total_out_eth) / total_out_eth * 100) if total_out_eth > 0 else 0
 
-        return {
-            "tx_count_90d": tx_count,
-            "volume_90d": round(volume, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "deposit_change_pct": round(deposit_change_pct, 2)
-        }
-    except Exception as e:
-        logger.error(f"Etherscan error for {address}: {e}")
-        return {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
+                logger.info(f"Etherscan OK: {tx_count} txs, volume={volume:.1f} ETH")
+                return {
+                    "tx_count_90d": tx_count,
+                    "volume_90d": round(volume, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "deposit_change_pct": round(pnl_pct, 2)
+                }
+
+            elif "rate limit" in message.lower() or status == "0":
+                logger.warning(f"Etherscan rate limit or no tx: {message}, retrying in 2s...")
+                time.sleep(2)
+                continue
+            else:
+                logger.error(f"Etherscan unexpected: status={status} message={message}")
+                return empty
+
+        except Exception as e:
+            logger.error(f"Etherscan exception (attempt {attempt+1}): {e}")
+            time.sleep(2)
+
+    logger.error(f"Etherscan failed after 3 attempts for {address[:10]}...")
+    return empty
 
 def score_wallet(balance, stats):
     score = 0
