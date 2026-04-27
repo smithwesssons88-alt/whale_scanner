@@ -16,7 +16,6 @@ def init_db():
                 score INTEGER,
                 tx_count_90d INTEGER,
                 volume_90d REAL,
-                pnl_pct REAL,
                 first_seen INTEGER,
                 last_seen INTEGER
             )
@@ -37,16 +36,15 @@ def save_wallet(address, balance, score, stats):
     now = int(time.time())
     with get_conn() as conn:
         conn.execute('''
-            INSERT INTO wallets (address, balance_eth, score, tx_count_90d, volume_90d, pnl_pct, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO wallets (address, balance_eth, score, tx_count_90d, volume_90d, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address) DO UPDATE SET
                 balance_eth=excluded.balance_eth,
                 score=excluded.score,
                 tx_count_90d=excluded.tx_count_90d,
                 volume_90d=excluded.volume_90d,
-                pnl_pct=excluded.pnl_pct,
                 last_seen=excluded.last_seen
-        ''', (address, balance, score, stats['tx_count_90d'], stats['volume_90d'], stats['pnl_pct'], now, now))
+        ''', (address, balance, score, stats['tx_count_90d'], stats['volume_90d'], now, now))
         conn.commit()
 
 def save_trade(address, tx_hash, value_eth, direction):
@@ -78,7 +76,7 @@ def get_stats():
 def get_candidates(min_score=50):
     with get_conn() as conn:
         rows = conn.execute('''
-            SELECT address, balance_eth, score, tx_count_90d, volume_90d, pnl_pct, last_seen
+            SELECT address, balance_eth, score, tx_count_90d, volume_90d, last_seen
             FROM wallets WHERE score >= ?
             ORDER BY score DESC LIMIT 50
         ''', (min_score,)).fetchall()
@@ -89,8 +87,7 @@ def get_candidates(min_score=50):
                 "score": r[2],
                 "tx_count_90d": r[3],
                 "volume_90d": r[4],
-                "pnl_pct": r[5],
-                "last_seen": r[6]
+                "last_seen": r[5]
             }
             for r in rows
         ]
