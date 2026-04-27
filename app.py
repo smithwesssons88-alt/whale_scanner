@@ -58,7 +58,7 @@ def get_eth_balance(address):
 
 def get_etherscan_history(address):
     """Get last 90 days tx stats from Etherscan with retry"""
-    url = "https://api.etherscan.io/api"
+    url = "https://api.etherscan.io/v2/api"
     cutoff = int(time.time()) - 90 * 86400
     empty = {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
 
@@ -67,6 +67,7 @@ def get_etherscan_history(address):
         return empty
 
     params = {
+        "chainid": 1,
         "module": "account",
         "action": "txlist",
         "address": address,
