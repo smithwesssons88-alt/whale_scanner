@@ -1,236 +1,320 @@
-"""
-app.py — Whale Parser
-Alchemy Webhook → глибокий аналіз (Etherscan) → скор → Telegram алерт → БД
-"""
 import os
+import json
+import time
 import logging
+import threading
 import requests
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+from flask import Flask, jsonify
 from web3 import Web3
+from database import init_db, save_wallet, save_trade, get_stats, get_candidates
 
-from database import (
-    init_db, upsert_wallet, save_trade,
-    is_cache_fresh, needs_deep_analysis, get_cached_profile,
-    get_copytrade_candidates, get_stats, COPYTRADE_MIN_SCORE,
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
 )
-from etherscan import deep_analyze
-
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
-MIN_ETH     = float(os.getenv("MIN_ETH_THRESHOLD", "5"))
-ALCHEMY_RPC = os.getenv("ALCHEMY_RPC_URL", "")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-w3  = Web3(Web3.HTTPProvider(ALCHEMY_RPC)) if ALCHEMY_RPC else None
-init_db()
 
-WHALE_LABELS = {
-    "0xd8da6bf26964af9d7eed9e03e53415d37aa96045": "Vitalik Buterin",
-    "0x47ac0fb4f2d84898e4d9e7b4dab3c24507a6d503": "Binance Hot Wallet",
-    "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8": "Binance Cold",
-    "0x28c6c06298d514db089934071355e5743bf21d60": "Binance 14",
-}
+# Config
+ALCHEMY_RPC_URL = os.environ.get('ALCHEMY_RPC_URL', '')
+ALCHEMY_WS_URL = os.environ.get('ALCHEMY_WS_URL', '')  # wss://eth-mainnet.g.alchemy.com/v2/KEY
+ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+MIN_ETH_THRESHOLD = float(os.environ.get('MIN_ETH_THRESHOLD', '100'))
+COPYTRADE_MIN_SCORE = int(os.environ.get('COPYTRADE_MIN_SCORE', '50'))
 
-def load_wallets(path="wallets.txt"):
-    if not os.path.exists(path):
-        return set()
-    with open(path) as f:
-        return {l.strip().lower() for l in f if l.strip().startswith("0x")}
+# Dedupe cache: avoid spamming same wallet multiple times per hour
+seen_recently = {}
+SEEN_TTL = 3600  # 1 hour
 
-WATCHED_WALLETS = load_wallets()
-log.info(f"Watching {len(WATCHED_WALLETS)} wallets")
-
-
-def get_label(address):
-    return WHALE_LABELS.get(address.lower(), f"{address[:6]}...{address[-4:]}")
-
-
-def fetch_and_score(address: str, label: str = ""):
-    if is_cache_fresh(address):
-        return get_cached_profile(address)
-
-    balance_eth = 0.0
-    tx_count    = 0
-    if w3:
-        try:
-            checksum    = w3.to_checksum_address(address)
-            balance_eth = float(w3.from_wei(w3.eth.get_balance(checksum), "ether"))
-            tx_count    = w3.eth.get_transaction_count(checksum)
-        except Exception as e:
-            log.error(f"RPC error for {address}: {e}")
-
-    deep_metrics = None
-    if needs_deep_analysis(address):
-        deep_metrics = deep_analyze(address, balance_eth)
-
-    return upsert_wallet(address, balance_eth, tx_count, label, deep_metrics)
-
-
-def parse_value(activity: dict) -> tuple[float, str]:
-    """Парсить суму і актив з активності Alchemy."""
-    asset = activity.get("asset", "ETH")
-    raw   = activity.get("value", "0x0")
-
-    # ETH — hex рядок
-    if isinstance(raw, str) and raw.startswith("0x"):
-        value = int(raw, 16) / 1e18
-        return value, asset
-
-    # Token transfers — value може бути числом або рядком
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        value = float(raw or 0)
-    except:
-        value = 0.0
-
-    return value, asset
-
-
-def build_alert(activity: dict, profile):
-    try:
-        frm   = activity.get("fromAddress", "")
-        to    = activity.get("toAddress", "")
-        tx    = activity.get("hash", "")
-        block = activity.get("blockNum", "")
-
-        value_eth, asset = parse_value(activity)
-
-        # Для ETH перевіряємо мінімальний поріг
-        # Для токенів (USDT, USDC тощо) пропускаємо якщо немає ETH еквіваленту
-        if asset == "ETH" and value_eth < MIN_ETH:
-            log.info(f"Skip: {value_eth:.4f} ETH < {MIN_ETH} ETH threshold")
-            return None
-
-        # Пропускаємо нульові token transfers
-        if asset != "ETH" and value_eth == 0:
-            return None
-
-        direction = "📤 SEND" if frm.lower() in WATCHED_WALLETS else "📥 RECEIVE"
-
-        score_line     = ""
-        pnl_line       = ""
-        candidate_line = ""
-
-        if profile:
-            score_line = f"*Score:* `{profile.score}/100` {profile.tier}\n"
-
-            if profile.deep_analyzed:
-                dep_sign = "+" if profile.deposit_change_pct >= 0 else ""
-                pnl_sign = "+" if profile.trading_pnl_pct >= 0 else ""
-                pnl_line = (
-                    f"*Депозит 90д:* `{dep_sign}{profile.deposit_change_pct:.1f}%` | "
-                    f"*P&L угод:* `{pnl_sign}{profile.trading_pnl_pct:.1f}%`\n"
-                    f"*Обсяг 90д:* `{profile.eth_volume_90d:,.0f} ETH` | "
-                    f"*Txs 90д:* `{profile.tx_count_90d}`\n"
-                )
-
-            if profile.is_copytrade_candidate:
-                candidate_line = "⭐ *Кандидат для копітрейдингу*\n"
-
-        # Форматування суми
-        if asset == "ETH":
-            amount_str = f"{value_eth:,.4f} ETH"
-        else:
-            amount_str = f"{value_eth:,.2f} {asset}"
-
-        msg = (
-            f"🐋 *Whale Alert* {direction}\n\n"
-            f"*From:* `{get_label(frm)}`\n"
-            f"*To:* `{get_label(to)}`\n"
-            f"*Amount:* `{amount_str}`\n"
-            f"{score_line}"
-            f"{pnl_line}"
-            f"*Block:* `{block}`\n"
-            f"{candidate_line}\n"
-            f"[🔍 Etherscan](https://etherscan.io/tx/{tx})"
-        )
-
-        return msg, value_eth
-    except Exception as e:
-        log.error(f"build_alert error: {e}")
-        return None
-
-
-def send_telegram(msg: str):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
         }, timeout=10)
-        if not resp.ok:
-            log.error(f"Telegram error: {resp.status_code} {resp.text}")
+        if r.status_code == 200:
+            logger.info("Telegram alert sent OK")
         else:
-            log.info("Telegram alert sent OK")
+            logger.error(f"Telegram error: {r.status_code} {r.text}")
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        logger.error(f"Telegram exception: {e}")
 
+def get_eth_balance(address):
+    try:
+        w3 = Web3(Web3.HTTPProvider(ALCHEMY_RPC_URL))
+        balance_wei = w3.eth.get_balance(Web3.to_checksum_address(address))
+        return float(Web3.from_wei(balance_wei, 'ether'))
+    except Exception as e:
+        logger.error(f"Balance error for {address}: {e}")
+        return 0.0
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-    if not data:
-        return jsonify({"error": "no data"}), 400
+def get_etherscan_history(address):
+    """Get last 90 days tx stats from Etherscan"""
+    try:
+        # Normal transactions
+        url = "https://api.etherscan.io/api"
+        cutoff = int(time.time()) - 90 * 86400
 
-    activities = data.get("activity", [])
-    log.info(f"Webhook: {len(activities)} activities")
+        params = {
+            "module": "account",
+            "action": "txlist",
+            "address": address,
+            "startblock": 0,
+            "endblock": 99999999,
+            "sort": "desc",
+            "apikey": ETHERSCAN_API_KEY
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-    alerts_sent = 0
-    for activity in activities:
-        frm = activity.get("fromAddress", "")
-        if not frm:
-            continue
+        if data.get("status") != "1":
+            return {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
 
-        log.info(f"Activity: from={frm[:10]}... asset={activity.get('asset')} value={activity.get('value')}")
+        txs = data.get("result", [])
+        recent = [tx for tx in txs if int(tx.get("timeStamp", 0)) >= cutoff]
 
-        label   = WHALE_LABELS.get(frm.lower(), "")
-        profile = fetch_and_score(frm, label)
+        tx_count = len(recent)
+        total_in = sum(int(tx["value"]) for tx in recent if tx.get("to", "").lower() == address.lower() and tx.get("isError") == "0")
+        total_out = sum(int(tx["value"]) for tx in recent if tx.get("from", "").lower() == address.lower() and tx.get("isError") == "0")
 
-        result = build_alert(activity, profile)
-        if not result:
-            continue
+        total_in_eth = total_in / 1e18
+        total_out_eth = total_out / 1e18
+        volume = total_in_eth + total_out_eth
 
-        msg, value_eth = result
-        send_telegram(msg)
-        alerts_sent += 1
+        pnl_pct = ((total_in_eth - total_out_eth) / total_out_eth * 100) if total_out_eth > 0 else 0
+        deposit_change_pct = ((total_in_eth - total_out_eth) / max(total_out_eth, 1) * 100)
 
-        save_trade(
-            tx_hash       = activity.get("hash", ""),
-            from_addr     = frm,
-            to_addr       = activity.get("toAddress", ""),
-            value_eth     = value_eth,
-            asset         = activity.get("asset", "ETH"),
-            block_num     = activity.get("blockNum", ""),
-            score_at_time = profile.score if profile else 0,
+        return {
+            "tx_count_90d": tx_count,
+            "volume_90d": round(volume, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "deposit_change_pct": round(deposit_change_pct, 2)
+        }
+    except Exception as e:
+        logger.error(f"Etherscan error for {address}: {e}")
+        return {"tx_count_90d": 0, "volume_90d": 0.0, "pnl_pct": 0.0, "deposit_change_pct": 0.0}
+
+def score_wallet(balance, stats):
+    score = 0
+    # Balance score (max 25)
+    if balance >= 10000: score += 25
+    elif balance >= 1000: score += 20
+    elif balance >= 500: score += 15
+    elif balance >= 100: score += 10
+    elif balance >= 10: score += 5
+
+    # Volume 90d (max 25)
+    vol = stats["volume_90d"]
+    if vol >= 100000: score += 25
+    elif vol >= 10000: score += 20
+    elif vol >= 1000: score += 15
+    elif vol >= 100: score += 8
+
+    # Tx count 90d (max 20)
+    txc = stats["tx_count_90d"]
+    if txc >= 1000: score += 20
+    elif txc >= 500: score += 15
+    elif txc >= 100: score += 10
+    elif txc >= 10: score += 5
+
+    # Deposit change (max 15)
+    dc = stats["deposit_change_pct"]
+    if dc >= 50: score += 15
+    elif dc >= 20: score += 10
+    elif dc >= 5: score += 5
+
+    # PnL (max 15)
+    pnl = stats["pnl_pct"]
+    if pnl >= 50: score += 15
+    elif pnl >= 20: score += 10
+    elif pnl >= 5: score += 5
+
+    return min(score, 100)
+
+def get_tier(score):
+    if score >= 80: return "🐋 Mega Whale"
+    if score >= 60: return "🦈 Whale"
+    if score >= 40: return "🐬 Mid Whale"
+    if score >= 20: return "🐟 Small Fish"
+    return "🦐 Noise"
+
+def process_transaction(tx_hash, from_addr, to_addr, value_eth, is_pending=True):
+    """Process a detected large transaction"""
+    now = time.time()
+    
+    # Dedupe: skip if we processed this address recently
+    if from_addr in seen_recently and (now - seen_recently[from_addr]) < SEEN_TTL:
+        logger.info(f"Skip duplicate {from_addr[:10]}... (seen recently)")
+        return
+    seen_recently[from_addr] = now
+
+    # Clean old entries
+    expired = [k for k, v in seen_recently.items() if now - v > SEEN_TTL]
+    for k in expired:
+        del seen_recently[k]
+
+    logger.info(f"Processing whale tx: {from_addr[:10]}... sent {value_eth:.1f} ETH")
+
+    # Get balance and history
+    balance = get_eth_balance(from_addr)
+    stats = get_etherscan_history(from_addr)
+    score = score_wallet(balance, stats)
+    tier = get_tier(score)
+
+    # Save to DB
+    save_wallet(from_addr, balance, score, stats)
+    save_trade(from_addr, tx_hash, value_eth, "OUT")
+
+    # Build Telegram message
+    copytrade_flag = "✅ КОПІТРЕЙД" if score >= COPYTRADE_MIN_SCORE else "❌ не рекомендовано"
+    status = "⏳ Pending" if is_pending else "✅ Confirmed"
+
+    msg = (
+        f"{tier} <b>Whale Alert!</b>\n\n"
+        f"{status}\n"
+        f"💸 <b>{value_eth:.2f} ETH</b> (${value_eth * 3000:,.0f})\n\n"
+        f"📤 From: <code>{from_addr}</code>\n"
+        f"📥 To: <code>{to_addr[:20]}...</code>\n"
+        f"🔗 TX: <a href='https://etherscan.io/tx/{tx_hash}'>Etherscan</a>\n\n"
+        f"📊 <b>Аналіз гаманця (90д):</b>\n"
+        f"  💰 Баланс: {balance:.1f} ETH\n"
+        f"  📈 Обсяг: {stats['volume_90d']:,.0f} ETH\n"
+        f"  🔄 Кількість tx: {stats['tx_count_90d']}\n"
+        f"  📉 P&L: {stats['pnl_pct']:+.1f}%\n\n"
+        f"🏆 Score: <b>{score}/100</b>\n"
+        f"{copytrade_flag}\n"
+        f"🌐 <a href='https://etherscan.io/address/{from_addr}'>Профіль</a>"
+    )
+
+    send_telegram(msg)
+    logger.info(f"Alert sent: {from_addr[:10]}... score={score} value={value_eth:.1f} ETH")
+
+def watch_pending_transactions():
+    """WebSocket listener for pending transactions"""
+    import websocket
+
+    ws_url = ALCHEMY_WS_URL
+    if not ws_url:
+        # Derive from RPC URL
+        if ALCHEMY_RPC_URL:
+            key = ALCHEMY_RPC_URL.rstrip('/').split('/')[-1]
+            ws_url = f"wss://eth-mainnet.g.alchemy.com/v2/{key}"
+        else:
+            logger.error("No Alchemy WS URL configured!")
+            return
+
+    subscribe_msg = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_subscribe",
+        "params": ["alchemy_pendingTransactions"]
+    })
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            params = data.get("params", {})
+            result = params.get("result", {})
+
+            if not result:
+                return
+
+            value_hex = result.get("value", "0x0")
+            value_wei = int(value_hex, 16)
+            value_eth = value_wei / 1e18
+
+            if value_eth < MIN_ETH_THRESHOLD:
+                return
+
+            tx_hash = result.get("hash", "")
+            from_addr = result.get("from", "")
+            to_addr = result.get("to", "") or "Contract"
+
+            if not from_addr:
+                return
+
+            logger.info(f"Large tx detected: {value_eth:.1f} ETH from {from_addr[:10]}...")
+
+            # Process in separate thread to not block WS
+            t = threading.Thread(
+                target=process_transaction,
+                args=(tx_hash, from_addr, to_addr, value_eth, True),
+                daemon=True
+            )
+            t.start()
+
+        except Exception as e:
+            logger.error(f"on_message error: {e}")
+
+    def on_error(ws, error):
+        logger.error(f"WebSocket error: {error}")
+
+    def on_close(ws, close_status_code, close_msg):
+        logger.warning(f"WebSocket closed: {close_status_code} {close_msg}")
+        logger.info("Reconnecting in 5s...")
+        time.sleep(5)
+        start_ws()
+
+    def on_open(ws):
+        logger.info("WebSocket connected, subscribing to pending transactions...")
+        ws.send(subscribe_msg)
+
+    def start_ws():
+        ws = websocket.WebSocketApp(
+            ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
         )
+        ws.run_forever(ping_interval=30, ping_timeout=10)
 
-    return jsonify({"ok": True, "alerts_sent": alerts_sent}), 200
+    start_ws()
 
 
-@app.route("/health", methods=["GET"])
+# Flask endpoints
+@app.route('/health')
 def health():
-    return jsonify({"status": "ok", **get_stats()})
+    stats = get_stats()
+    return jsonify({
+        "status": "ok",
+        "threshold_eth": MIN_ETH_THRESHOLD,
+        **stats
+    })
 
-
-@app.route("/candidates", methods=["GET"])
+@app.route('/candidates')
 def candidates():
-    limit = int(request.args.get("limit", 50))
-    data  = get_copytrade_candidates(limit)
-    return jsonify({"min_score": COPYTRADE_MIN_SCORE, "count": len(data), "candidates": data})
+    wallets = get_candidates(COPYTRADE_MIN_SCORE)
+    return jsonify(wallets)
+
+@app.route('/test')
+def test_alert():
+    """Send a test alert"""
+    send_telegram(
+        "🧪 <b>Test Alert</b>\n\n"
+        "Whale monitor is running!\n"
+        f"Threshold: {MIN_ETH_THRESHOLD} ETH\n"
+        "Monitoring: ALL pending transactions"
+    )
+    return jsonify({"status": "test sent"})
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return "🐋 Whale Parser is running", 200
+if __name__ == '__main__':
+    init_db()
+    logger.info(f"Starting Whale Monitor (threshold: {MIN_ETH_THRESHOLD} ETH)")
+    logger.info("Architecture: WebSocket → ALL pending tx → filter > threshold")
 
+    # Start WebSocket listener in background thread
+    ws_thread = threading.Thread(target=watch_pending_transactions, daemon=True)
+    ws_thread.start()
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
