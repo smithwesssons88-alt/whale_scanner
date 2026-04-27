@@ -27,6 +27,7 @@ COPYTRADE_MIN_SCORE = int(os.environ.get('COPYTRADE_MIN_SCORE', '50'))
 
 # Dedupe cache: avoid spamming same wallet multiple times per hour
 seen_recently = {}
+seen_lock = threading.Lock()
 SEEN_TTL = 3600  # 1 hour
 
 def send_telegram(message):
@@ -175,17 +176,17 @@ def get_tier(score):
 def process_transaction(tx_hash, from_addr, to_addr, value_eth, is_pending=True):
     """Process a detected large transaction"""
     now = time.time()
-    
-    # Dedupe: skip if we processed this address recently
-    if from_addr in seen_recently and (now - seen_recently[from_addr]) < SEEN_TTL:
-        logger.info(f"Skip duplicate {from_addr[:10]}... (seen recently)")
-        return
-    seen_recently[from_addr] = now
 
-    # Clean old entries
-    expired = [k for k, v in seen_recently.items() if now - v > SEEN_TTL]
-    for k in expired:
-        del seen_recently[k]
+    # Dedupe with lock: skip if we processed this address recently
+    with seen_lock:
+        if from_addr in seen_recently and (now - seen_recently[from_addr]) < SEEN_TTL:
+            logger.info(f"Skip duplicate {from_addr[:10]}... (seen recently)")
+            return
+        seen_recently[from_addr] = now
+        # Clean old entries
+        expired = [k for k, v in seen_recently.items() if now - v > SEEN_TTL]
+        for k in expired:
+            del seen_recently[k]
 
     logger.info(f"Processing whale tx: {from_addr[:10]}... sent {value_eth:.1f} ETH")
 
